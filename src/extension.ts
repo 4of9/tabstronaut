@@ -250,6 +250,45 @@ export function activate(context: vscode.ExtensionContext) {
     dragAndDropController: treeDataProvider,
   });
 
+  // --- Sync file: initial load + file watcher ---
+  void treeDataProvider.loadFromSyncFile();
+
+  const syncFilePath = treeDataProvider.getSyncFilePath();
+  if (syncFilePath) {
+    let debounceTimer: NodeJS.Timeout | undefined;
+
+    const handleSyncFileChange = () => {
+      if (debounceTimer) {
+        clearTimeout(debounceTimer);
+      }
+      debounceTimer = setTimeout(async () => {
+        await treeDataProvider.loadFromSyncFile();
+      }, 200);
+    };
+
+    // Use VS Code's file system watcher for reliable cross-platform watching
+    const syncGlob = new vscode.RelativePattern(
+      vscode.workspace.workspaceFolders![0],
+      ".tabstronaut.json"
+    );
+    const syncWatcher = vscode.workspace.createFileSystemWatcher(syncGlob);
+
+    context.subscriptions.push(syncWatcher.onDidChange(handleSyncFileChange));
+    context.subscriptions.push(syncWatcher.onDidCreate(handleSyncFileChange));
+    context.subscriptions.push(syncWatcher.onDidDelete(() => {
+      // File was deleted externally -- could clear state, but for now just ignore
+    }));
+    context.subscriptions.push(syncWatcher);
+
+    context.subscriptions.push({
+      dispose: () => {
+        if (debounceTimer) {
+          clearTimeout(debounceTimer);
+        }
+      },
+    });
+  }
+
   let recentlyDeletedGroup:
     | (Group & { index: number; previousGroupId?: string })
     | null = null;

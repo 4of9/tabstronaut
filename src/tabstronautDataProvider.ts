@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import * as fs from "fs";
+import * as crypto from "crypto";
 import { Group, TabItem } from "./models/Group";
 import {
   generateUuidv4,
@@ -35,6 +37,7 @@ export class TabstronautDataProvider
   private refreshIntervalId?: NodeJS.Timeout;
   private ungroupedGroup: Group;
   private groupFilter?: string;
+  private _lastWrittenHash: string = "";
 
   constructor(private workspaceState: vscode.Memento) {
     const groupData = this.workspaceState.get<{
@@ -810,30 +813,9 @@ export class TabstronautDataProvider
   }
 
   async updateWorkspaceState(): Promise<void> {
-    let groupData: {
-      [key: string]: {
-        label: string;
-        items: string[];
-        creationTime: string;
-        colorName: string;
-      };
-    } = {};
-    this.groupsMap.forEach((group, id) => {
-      if (typeof group.label === "string") {
-        let items = group.items.map((item) => item.resourceUri?.fsPath as string);
-        groupData[id] = {
-          label: group.label,
-          items: items,
-          creationTime: group.creationTime.toISOString(),
-          colorName: group.colorName,
-        };
-      } else {
-        vscode.window.showErrorMessage(
-          "Invalid Tab Group name. Please try again."
-        );
-      }
-    });
+    const groupData = this.serializeGroups();
     await this.workspaceState.update("tabGroups", groupData);
+    await this.writeSyncFile();
     this.refreshUngroupedTabs();
     this._onDidChangeTreeData.fire();
   }
@@ -1043,6 +1025,146 @@ export class TabstronautDataProvider
         newGroup.addItem(filePath)
       );
       this.groupsMap.set(id, newGroup);
+    }
+  }
+
+  // --- Sync file support ---
+
+  /** Returns the path to .tabstronaut.json in the workspace root, or undefined if no workspace. */
+  getSyncFilePath(): string | undefined {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!workspaceRoot) {
+      return undefined;
+    }
+    return path.join(workspaceRoot, ".tabstronaut.json");
+  }
+
+  /** Compute a content hash for echo-loop prevention. */
+  private computeHash(content: string): string {
+    return crypto.createHash("md5").update(content).digest("hex");
+  }
+
+  /** Get the last written hash so the file watcher can compare. */
+  getLastWrittenHash(): string {
+    return this._lastWrittenHash;
+  }
+
+  /** Write current state to the sync file on disk. */
+  private async writeSyncFile(): Promise<void> {
+    const syncPath = this.getSyncFilePath();
+    if (!syncPath) {
+      return;
+    }
+
+    const groupData = this.serializeGroups();
+    const content = JSON.stringify(groupData, null, 2);
+    this._lastWrittenHash = this.computeHash(content);
+
+    try {
+      await fs.promises.writeFile(syncPath, content, "utf8");
+    } catch (err) {
+      // Silently ignore write errors (e.g., read-only filesystem)
+    }
+  }
+
+  /** Serialize the current groups map to the JSON format. */
+  private serializeGroups(): {
+    [key: string]: {
+      label: string;
+      items: string[];
+      creationTime: string;
+      colorName: string;
+    };
+  } {
+    let groupData: {
+      [key: string]: {
+        label: string;
+        items: string[];
+        creationTime: string;
+        colorName: string;
+      };
+    } = {};
+    this.groupsMap.forEach((group, id) => {
+      if (typeof group.label === "string") {
+        let items = group.items.map(
+          (item) => item.resourceUri?.fsPath as string
+        );
+        groupData[id] = {
+          label: group.label,
+          items: items,
+          creationTime: group.creationTime.toISOString(),
+          colorName: group.colorName,
+        };
+      }
+    });
+    return groupData;
+  }
+
+  /** Validate that a parsed JSON object has the expected tab groups structure. */
+  private validateGroupData(data: any): data is {
+    [id: string]: {
+      label: string;
+      items: string[];
+      creationTime: string;
+      colorName: string;
+    };
+  } {
+    if (typeof data !== "object" || data === null || Array.isArray(data)) {
+      return false;
+    }
+    return Object.entries(data).every(([id, group]: [string, any]) => {
+      return (
+        typeof id === "string" &&
+        typeof group === "object" &&
+        group !== null &&
+        typeof group.label === "string" &&
+        Array.isArray(group.items) &&
+        group.items.every((item: any) => typeof item === "string") &&
+        typeof group.creationTime === "string" &&
+        typeof group.colorName === "string"
+      );
+    });
+  }
+
+  /**
+   * Load state from the sync file on disk, replacing current state.
+   * Returns true if state was loaded, false otherwise.
+   */
+  async loadFromSyncFile(): Promise<boolean> {
+    const syncPath = this.getSyncFilePath();
+    if (!syncPath) {
+      return false;
+    }
+
+    try {
+      await fs.promises.access(syncPath, fs.constants.R_OK);
+    } catch {
+      return false;
+    }
+
+    try {
+      const content = await fs.promises.readFile(syncPath, "utf8");
+      const hash = this.computeHash(content);
+
+      // Skip if this is our own write
+      if (hash === this._lastWrittenHash) {
+        return false;
+      }
+
+      const parsed = JSON.parse(content);
+      if (!this.validateGroupData(parsed)) {
+        return false;
+      }
+
+      // Replace workspace state entirely
+      await this.workspaceState.update("tabGroups", parsed);
+      this._lastWrittenHash = hash;
+      this.rebuildStateFromStorage();
+      this.refreshUngroupedTabs();
+      this._onDidChangeTreeData.fire();
+      return true;
+    } catch {
+      return false;
     }
   }
 }
